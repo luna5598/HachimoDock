@@ -1,0 +1,99 @@
+name: P4 firmware
+
+on:
+  push:
+    branches: [main, build/p4-firmware]
+    paths:
+      - firmware/**
+      - pc/public/terrier-clips/**
+      - pc/builtin-clawpkgs/**
+      - pc/scripts/package-factory-release.mjs
+      - .github/workflows/p4-firmware.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: python -m pip install Pillow pytest
+      - name: Check built-in assets
+        run: python firmware/tools/build_builtin_bundle.py --check
+      - name: Run host tests
+        run: |
+          rustc --version
+          python -m pytest firmware/tests -q
+          python firmware/tests/protocol_contract_test.py
+
+  build:
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: v1
+            environment: esp32_p4_evboard
+          - family: v3
+            environment: esp32_p4_evboard_v3
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Install build dependencies
+        run: python -m pip install platformio==6.1.19 Pillow
+      - name: Compile firmware and factory image
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          python -m platformio run -d firmware -e "${{ matrix.environment }}" -t factory -j 2 2>&1 | tee "logs/p4-${{ matrix.family }}.log"
+      - name: Package firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="dist/${{ matrix.family }}"
+          node pc/scripts/package-factory-release.mjs --build-dir "firmware/.pio/build/${{ matrix.environment }}" --output "$output"
+          cp "firmware/.pio/build/${{ matrix.environment }}/firmware.bin" "$output/firmware-${{ matrix.family }}.bin"
+          {
+            git rev-parse HEAD
+            python --version
+            python -m platformio --version
+          } > "$output/build-info.txt"
+          (cd "$output" && sha256sum *.zip *.bin > SHA256SUMS)
+      - name: Upload firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: HachimoDock-P4-${{ matrix.family }}
+          path: |
+            dist/${{ matrix.family }}/*.zip
+            dist/${{ matrix.family }}/*.bin
+            dist/${{ matrix.family }}/build-info.txt
+            dist/${{ matrix.family }}/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: P4-${{ matrix.family }}-build-log
+          path: logs/*.log
+          if-no-files-found: ignore
+          retention-days: 14
